@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .meldataset import (LogMelSpectrogram, MelDataset, get_dataset_filelist,
                          mel_spectrogram)
-from .models import (Generator, MultiPeriodDiscriminator,
+from .models import (GeneratorNSF, MultiPeriodDiscriminator,
                      MultiScaleDiscriminator, discriminator_loss, feature_loss,
                      generator_loss)
 from .utils import (AttrDict, build_env, load_checkpoint, plot_spectrogram,
@@ -34,7 +34,7 @@ def train(rank, a, h):
     torch.cuda.manual_seed(h.seed)
     device = torch.device('cuda:{:d}'.format(rank))
 
-    generator = Generator(h).to(device)
+    generator = GeneratorNSF(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
@@ -87,7 +87,6 @@ def train(rank, a, h):
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
                           fine_tuning=a.fine_tuning,
-                          audio_root_path=a.audio_root_path, feat_root_path=a.feature_root_path, 
                           use_alt_melcalc=USE_ALT_MELCALC)
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
@@ -104,7 +103,6 @@ def train(rank, a, h):
         validset = MelDataset(valid_df, h.segment_size, h.n_fft, h.num_mels,
                               h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              audio_root_path=a.audio_root_path, feat_root_path=a.feature_root_path, 
                               use_alt_melcalc=USE_ALT_MELCALC)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
@@ -136,14 +134,16 @@ def train(rank, a, h):
         for i, batch in pb:
             if rank == 0:
                 start_b = time.time()
-            x, y, _, y_mel = batch
+            x, f0, pitch, y, _, y_mel = batch
             x = x.to(device, non_blocking=True)
+            f0 = f0.to(device, non_blocking=True)
+            pitch = pitch.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             y_mel = y_mel.to(device, non_blocking=True)
             y = y.unsqueeze(1)
             
             with torch.cuda.amp.autocast(enabled=a.fp16):
-                y_g_hat = generator(x)
+                y_g_hat = generator(x, pitch, f0)
                 if USE_ALT_MELCALC:
                     y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
                 else:
@@ -227,14 +227,14 @@ def train(rank, a, h):
                     sw.add_scalar("training/disc_loss_total", loss_disc_all, steps)
 
                 # Validation
-                if steps % a.validation_interval == 0:  # and steps != 0:
+                if steps % a.validation_interval == 0 and steps != 0:
                     generator.eval()
                     torch.cuda.empty_cache()
                     val_err_tot = 0
                     with torch.no_grad():
                         for j, batch in progress_bar(enumerate(validation_loader), total=len(validation_loader), parent=mb):
-                            x, y, _, y_mel = batch
-                            y_g_hat = generator(x.to(device))
+                            x, f0, pitch, y, _, y_mel = batch
+                            y_g_hat = generator(x.to(device), pitch.to(device), f0.to(device))
                             y_mel = y_mel.to(device, non_blocking=True)
                             if USE_ALT_MELCALC:
                                 y_g_hat_mel = alt_melspec(y_g_hat.squeeze(1))
@@ -286,23 +286,22 @@ def train(rank, a, h):
 
 
 def main():
+    # python -m hifigan.train --input_training_file data_splits/wavlm-hifigan-train.csv --input_validation_file data_splits/wavlm-hifigan-valid.csv --checkpoint_path pretrained/nsf-HiFiGAN --config hifigan/config_v1_wavlm.json --training_epochs 120 --fine_tuning --fp16
     print('Initializing Training Process..')
 
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--audio_root_path', required=True)
-    parser.add_argument('--feature_root_path', required=True)
     parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
     parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=1500, type=int)
-    parser.add_argument('--stdout_interval', default=5, type=int)
+    parser.add_argument('--stdout_interval', default=25, type=int)
     parser.add_argument('--checkpoint_interval', default=5000, type=int)
     parser.add_argument('--summary_interval', default=25, type=int)
     parser.add_argument('--validation_interval', default=1000, type=int)
-    parser.add_argument('--fp16', default=False, type=bool)
+    parser.add_argument('--fp16', action='store_true')
     parser.add_argument('--fine_tuning', action='store_true')
 
     a = parser.parse_args()
